@@ -13,6 +13,7 @@ from awsglue.job import Job
 from datetime import datetime
 
 import json
+import traceback
 import csv, io, os
 import requests
 import mysql.connector
@@ -80,11 +81,12 @@ def processingFunc(partitionData, conversionRateMapping, mccExclusionDf, campaig
     }
     for row in partitionData:
         row = row.asDict()
-        row['mcc'] = int(row['mcc'])
-        row['cardTypeId'] = int(row['cardTypeId'])
-        row['remark'] = ''
-        print(row)
+
         try:
+            row['mcc'] = int(row['mcc'])
+            row['cardTypeId'] = int(row['cardTypeId'])
+            row['remark'] = ''
+            
             check_exclusion = len(mccExclusionDf.loc[(mccExclusionDf['card_type_id'] == row['cardTypeId']) & (mccExclusionDf['mcc_mcc'] == row['mcc'])]) > 0
             currencyRate = conversionRateMapping.get(row['currency'].upper(), False)
             if check_exclusion:
@@ -93,6 +95,9 @@ def processingFunc(partitionData, conversionRateMapping, mccExclusionDf, campaig
             elif not currencyRate:
                 print(f"{row[currency]} is not in currency mapping!")
                 row['remark'] = f"{row[currency]} is not in currency mapping!"
+                row['rewardAmountBase'] = None
+            elif "-" not in row['transaction_date']:
+                row['remark'] = f"Date format should be yyyy-mm-dd: {row['transaction_date']}"
                 row['rewardAmountBase'] = None
             else:
                 amount = float(row['amount']) * currencyRate
@@ -139,10 +144,13 @@ def processingFunc(partitionData, conversionRateMapping, mccExclusionDf, campaig
                         amount *= reward_rate
                         row[remarks_mapping['cols'][i]] = amount
                     row['remark'] += f"{remark},"
+                    
+                if row['remark'].count(',') < 3:
+                    raise Exception("Base, Cat, Campaign did not get processed!")
                         
         except Exception as e:
             print(e)
-            row['remark'] = f"Error in processing, {e}"
+            row['remark'] = f"Error in processing, {traceback.format_exc()}"
             row['rewardAmountBase'] = None
         yield Row(**row)
 
@@ -152,38 +160,37 @@ def sendToQueue(partitionData, queueName, tenant):
     
     for row in partitionData:
         row = row.asDict()
-        remarks = row['remark'].split(',')
-        amount_arr = [row['rewardAmountBase'],row['rewardAmountCat'],row['rewardAmountCampaign'] ]
-        for i in range(3):
-            if remarks[i] == '':
-                continue
-            date_arr = row['transaction_date'].split("/")
-            if len(date_arr[1]) == 1:
-                date_arr[1] = "0" + date_arr[1]
-            if len(date_arr[0]) == 1:
-                date_arr[0] = "0" + date_arr[0]
-            date_arr = [date_arr[2], date_arr[1], date_arr[0]]
-            date_string = "-".join(date_arr)
+        # print(row)
+        try:
+            remarks = row['remark'].split(',')
+
+            amount_arr = [row['rewardAmountBase'],row['rewardAmountCat'],row['rewardAmountCampaign'] ]
+            for i in range(3):
+                if remarks[i] == '':
+                    continue
+                
+                message_body = {
+                    "tenant": tenant.upper(),
+                    "transactionId": row['transaction_id'],
+                    "transactionDate": row['transaction_date'],
+                    "cardId": row['card_id'],
+                    "merchant": row['merchant'],
+                    "mcc": row['mcc'],
+                    "currency": row['currency'],
+                    "amount": float(row['amount']),
+                    "rewardAmount": round(float(amount_arr[i]),2),
+                    "remarks": remarks[i]
+                }
+                try:
+                    response = queue.send_message(MessageBody=json.dumps(message_body))
+                except Exception as e:
+                    print(e)
+                    sqs = boto3.resource('sqs')
+                    queue = sqs.get_queue_by_name(QueueName=queueName)
+                    response = queue.send_message(MessageBody=message_body)
+        except Exception as e:
+            print(f"SEND TO QUEUE ERROR, {e}")
             
-            message_body = {
-                "tenant": tenant.upper(),
-                "transactionId": row['transaction_id'],
-                "transactionDate": date_string,
-                "cardId": row['card_id'],
-                "merchant": row['merchant'],
-                "mcc": row['mcc'],
-                "currency": row['currency'],
-                "amount": float(row['amount']),
-                "rewardAmount": round(float(amount_arr[i]),2),
-                "remarks": remarks[i]
-            }
-            try:
-                response = queue.send_message(MessageBody=json.dumps(message_body))
-            except Exception as e:
-                print(e)
-                sqs = boto3.resource('sqs')
-                queue = sqs.get_queue_by_name(QueueName=queueName)
-                response = queue.send_message(MessageBody=message_body)
 
 def get_client(resource, profile=None):
     """
@@ -218,6 +225,17 @@ print("Read csv data...")
 s3_df = spark.read.format("csv").option("header", "true").load(csvFile)
 s3_df = s3_df.withColumn("remark", lit(None).cast(StringType()))
 ORIGINAL_COUNT = s3_df.count()
+
+# # Change datetime format
+# print("Change datetime format")
+# original_cols = s3_df.columns
+# print(original_cols)
+# s3_df = s3_df.withColumn("1", f.split('transaction_date', '/')[0]).withColumn("2", f.split('transaction_date', '/')[1]).withColumn("3", f.split('transaction_date', '/')[2])
+# s3_df = s3_df.withColumn('transaction_date', concat(col('1'), lit('-'), when( f.length(col('2')) == 1, lit('0') ).otherwise( lit("") ), col('2'),  lit('-'), when( f.length(col('3')) == 1, lit('0') ).otherwise( lit("") ),col('3')) )
+# columns_to_drop = ['1', '2', '3']
+# s3_df = s3_df.drop(*columns_to_drop)
+
+# # print(s3_df.show())
 
 #################################################################
 # Validate
@@ -298,6 +316,7 @@ deptSchema = StructType([
 s3_df = spark.createDataFrame(s3_df_rdd, schema = deptSchema)
 
 # s3_df = s3_df_rdd.toDF()
+# s3_df.show()
 
 # Last validation
 errorDf = errorDf.union(s3_df.filter(col('rewardAmountBase').isNull()).select(errorDf.columns) )
@@ -306,11 +325,13 @@ ERROR_COUNT = errorDf.count()
 
 # Write error Files
 print("Write error file...")
-errorDf.coalesce(1).write.format('csv').option("header", "true").save(s3_error_path)
 
-s3 = get_client("s3", None)
-rsp = s3.list_objects_v2(Bucket="spend-t3-bucket", Prefix=f"error/{ERROR_FOLDER}/", Delimiter="/")
+if ERROR_COUNT > 0:
+    errorDf.coalesce(1).write.format('csv').option("header", "true").save(s3_error_path)
+    
 try:
+    s3 = get_client("s3", None)
+    rsp = s3.list_objects_v2(Bucket="spend-t3-bucket", Prefix=f"error/{ERROR_FOLDER}/", Delimiter="/")
     objectList = list(obj["Key"] for obj in rsp["Contents"])
     for obj in objectList:
         print(obj)
